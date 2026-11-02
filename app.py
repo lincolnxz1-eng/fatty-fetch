@@ -34,7 +34,7 @@ ZH = ("yue", "zh-HK", "zh-Hant", "zh-TW", "zh-Hans", "zh-CN", "zh-SG", "zh")
 
 def platform(u):
     h = re.sub(r"^https?://", "", u).split("/")[0].lower()
-    return "YouTube" if re.search(r"youtu\.?be", h) else "Instagram" if "instagram" in h else "TikTok" if "tiktok" in h else "other"
+    return "YouTube" if re.search(r"youtu\.?be", h) else "Instagram" if "instagram" in h else "TikTok" if "tiktok" in h else "Facebook" if re.search(r"(^|\.)(facebook\.com|fb\.watch|fb\.com)$", h) else "other"
 
 def clean_subs(text):
     out = []
@@ -74,6 +74,44 @@ def thumb_data(u):
         if ct.startswith("image") and 1000 < len(b) < 1_500_000: return "data:%s;base64,%s" % (ct, base64.b64encode(b).decode())
     except Exception: pass
 
+def social_fetch(url, plat, ck, device_ck, common):
+    """Instagram / TikTok / Facebook: the post caption (description) plus any subtitle track yt-dlp exposes. ck = this phone's cookies only."""
+    opts = {k: v for k, v in common.items()}
+    if ck: opts["cookiefile"] = ck
+    else: opts.pop("cookiefile", None)  # the server's YouTube cookie file is not for other sites
+    opts["ignore_no_formats_error"] = True
+    try:
+        with yt_dlp.YoutubeDL(opts) as y: info = y.extract_info(url, download=False)
+    except Exception as e:
+        m = str(e).split(":", 1)[-1].strip()[:240]
+        locked = bool(re.search(r"blocked|log ?in|sign ?in|cookies|private|rate.?limit|not available|empty media|unavailable", m, re.I))
+        return err(f"Couldn't read this {plat} post ({m})." + (f" Sign in to {plat} in Fatty and try again, or paste the caption into box 2." if locked else " Paste the caption into box 2."),
+                   503 if locked else 502, needs_login=locked and not device_ck, blocked=locked, device_cookies=device_ck, site=plat)
+    if info and info.get("entries"): info = next((e for e in info["entries"] if e), info)
+    text = ""; lang = kind = None
+    for k2, tracks in (("manual", info.get("subtitles") or {}), ("auto", info.get("automatic_captions") or {})):
+        for l, fmts in tracks.items():
+            for f in sorted(fmts or [], key=lambda f: f.get("ext") != "vtt"):
+                if not f.get("url"): continue
+                try:
+                    raw = urllib.request.urlopen(urllib.request.Request(f["url"], headers={"User-Agent": "Mozilla/5.0"}), timeout=15).read().decode("utf-8", "ignore")
+                    t = clean_subs(raw)
+                    if len(t) > 40 and (not text or l.lower().startswith("en")): text, lang, kind = t, l, k2
+                    break
+                except Exception: pass
+    desc = (info.get("description") or info.get("title") or "")[:4000]
+    if len(text) <= 40 and len(desc) <= 40:
+        return err(f"This {plat} post has no caption text or subtitles the server can read. Paste the recipe into box 2.", 404, site=plat)
+    hint = None if len(text) > 40 or not promo_only(desc) else "The post caption has no ingredient list and there are no subtitles. Paste the recipe into box 2."
+    th = info.get("thumbnail") or next((t.get("url") for t in reversed(info.get("thumbnails") or []) if t.get("url")), None)
+    title = info.get("title") or ""
+    if not title or title == desc: title = (desc.split("\n")[0][:80] or f"{plat} post")
+    return {"transcript": text if len(text) > 40 else "", "captions": text, "title": title, "description": desc,
+            "thumbnail": th, "thumbnail_data": thumb_data(th) if th else None, "url": url, "source_url": info.get("webpage_url") or url,
+            "platform": plat, "language": lang, "caption_kind": kind, "source": "captions" if len(text) > 40 else "description",
+            "caption_error": None if len(text) > 40 else "No subtitle track on this post; used the post caption.", "hint": hint,
+            "device_cookies": device_ck, "clients_tried": []}
+
 def err(msg, code=400, **kw): return JSONResponse({"error": msg, **kw}, status_code=code)
 
 @app.get("/health")
@@ -92,9 +130,7 @@ async def fetch(request: Request, x_fatty_key: str = Header(default="")):
     url = (url or "").strip()
     if not re.match(r"^https?://", url): return err("Send {\"url\": \"https://...\"}.")
     plat = platform(url)
-    if plat in ("Instagram", "TikTok"):
-        return err(f"{plat} isn't supported by the hosted fetch yet (it needs your login cookies). Paste the caption into box 2, or use the Computer bridge.", 422, needs_login=True, site=plat)
-    if plat != "YouTube": return err("The hosted fetch only does YouTube links for now.", 422)
+    if plat not in ("YouTube", "Instagram", "TikTok", "Facebook"): return err("The hosted fetch does YouTube, Instagram, TikTok and Facebook links.", 422)
     tmp = tempfile.mkdtemp(prefix="fatty_")
     try:
         common = {"quiet": True, "no_warnings": True, "noprogress": True, "noplaylist": True, "skip_download": True, "socket_timeout": 25,
@@ -110,6 +146,7 @@ async def fetch(request: Request, x_fatty_key: str = Header(default="")):
                 fd = os.open(ck, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
                 with os.fdopen(fd, "w") as f: f.write(c if c.startswith("# Netscape") else "# Netscape HTTP Cookie File\n" + c)
         ck = ck or cookie_file()
+        if plat != "YouTube": return social_fetch(url, plat, ck, bool(user_ck), common)
         if ck: common["cookiefile"] = ck
         base = dict(common); info = None; last = ""
         for chain in CLIENT_CHAINS:
