@@ -82,10 +82,13 @@ def health(): return {"ok": True, "yt_dlp": yt_dlp.version.__version__, "key_req
 @app.api_route("/fetch", methods=["GET", "POST"])
 async def fetch(request: Request, x_fatty_key: str = Header(default="")):
     if KEY and x_fatty_key != KEY: return err("Wrong or missing X-Fatty-Key.", 401)
-    url = request.query_params.get("url")
+    url = request.query_params.get("url"); user_ck = None
     if request.method == "POST":
-        try: url = (await request.json()).get("url") or url
+        try:
+            body = await request.json(); url = body.get("url") or url
+            user_ck = body.get("cookies") or request.headers.get("x-fatty-yt-cookies") or None
         except Exception: pass
+    else: user_ck = request.headers.get("x-fatty-yt-cookies") or None
     url = (url or "").strip()
     if not re.match(r"^https?://", url): return err("Send {\"url\": \"https://...\"}.")
     plat = platform(url)
@@ -96,7 +99,17 @@ async def fetch(request: Request, x_fatty_key: str = Header(default="")):
     try:
         common = {"quiet": True, "no_warnings": True, "noprogress": True, "noplaylist": True, "skip_download": True, "socket_timeout": 25,
                   "outtmpl": os.path.join(tmp, "v.%(ext)s")}
-        ck = cookie_file()
+        ck = None
+        if user_ck and isinstance(user_ck, str) and len(user_ck) < 200_000:  # this device's session, for this request only
+            c = user_ck.strip()
+            if "\t" not in c:
+                try: c = base64.b64decode(c).decode()
+                except Exception: c = ""
+            if "\t" in c:
+                ck = os.path.join(tmp, "req_cookies.txt")
+                fd = os.open(ck, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w") as f: f.write(c if c.startswith("# Netscape") else "# Netscape HTTP Cookie File\n" + c)
+        ck = ck or cookie_file()
         if ck: common["cookiefile"] = ck
         base = dict(common); info = None; last = ""
         for chain in CLIENT_CHAINS:
@@ -109,7 +122,7 @@ async def fetch(request: Request, x_fatty_key: str = Header(default="")):
                 last = str(e)
         if not info:
             if re.search(r"not a bot|sign in|cookies", last, re.I):
-                return err("YouTube blocked the server (\"sign in to confirm you're not a bot\")" + ("" if ck else "; set FATTY_YT_COOKIES on the server") + ". Paste the captions or use the Computer bridge.", 503, blocked=True, cookies=bool(ck))
+                return err("YouTube blocked the server (\"sign in to confirm you're not a bot\")" + ("" if ck else "; set FATTY_YT_COOKIES on the server") + ". Paste the captions or use the Computer bridge.", 503, blocked=True, cookies=bool(ck), device_cookies=bool(user_ck), needs_login=not user_ck, site="YouTube")
             return err("Couldn't fetch from YouTube: " + last.split(":", 1)[-1].strip()[:200], 502)
         used = common.get("extractor_args", {}).get("youtube", {}).get("player_client")
         lang, track, kind = pick_lang(info); text = ""; cap_err = None; cap_opts = None; tried = [f"{used}:{len(info.get('subtitles') or {})}/{len(info.get('automatic_captions') or {})}"]
