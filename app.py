@@ -8,7 +8,7 @@ import yt_dlp
 KEY = os.environ.get("FATTY_FETCH_KEY", "")
 CLIENT_CHAINS = [None, ["tv_embedded", "android_vr"], ["android_vr"], ["tv_simply", "web_safari", "mweb"]]
 
-CAPTION_CHAINS = [None, ["mweb"], ["web_safari"], ["web"]]
+CAPTION_CHAINS = [None, ["mweb"], ["web_safari"], ["web"], ["tv"], ["web_embedded"], ["ios"], ["android"], ["web_creator"]]
 
 def promo_only(desc):
     d = desc or ""
@@ -112,7 +112,7 @@ async def fetch(request: Request, x_fatty_key: str = Header(default="")):
                 return err("YouTube blocked the server (\"sign in to confirm you're not a bot\")" + ("" if ck else "; set FATTY_YT_COOKIES on the server") + ". Paste the captions or use the Computer bridge.", 503, blocked=True, cookies=bool(ck))
             return err("Couldn't fetch from YouTube: " + last.split(":", 1)[-1].strip()[:200], 502)
         used = common.get("extractor_args", {}).get("youtube", {}).get("player_client")
-        lang, track, kind = pick_lang(info); text = ""; cap_err = None; cap_opts = None
+        lang, track, kind = pick_lang(info); text = ""; cap_err = None; cap_opts = None; tried = [f"{used}:{len(info.get('subtitles') or {})}/{len(info.get('automatic_captions') or {})}"]
         if not track:  # metadata client exposed no caption maps: ask caption-capable clients and merge
             for chain in CAPTION_CHAINS:
                 if chain == used: continue
@@ -121,7 +121,8 @@ async def fetch(request: Request, x_fatty_key: str = Header(default="")):
                 try:
                     with yt_dlp.YoutubeDL(o) as y: i2 = y.extract_info(url, download=False)
                 except Exception as e:
-                    cap_err = cap_err or str(e).split(":", 1)[-1].strip()[:200]; continue
+                    cap_err = cap_err or str(e).split(":", 1)[-1].strip()[:200]; tried.append(f"{chain}:err"); continue
+                tried.append(f"{chain}:{len((i2 or {}).get('subtitles') or {})}/{len((i2 or {}).get('automatic_captions') or {})}")
                 if i2 and pick_lang(i2)[1]:
                     info["subtitles"] = i2.get("subtitles") or {}; info["automatic_captions"] = i2.get("automatic_captions") or {}
                     for k in ("title", "description", "thumbnail"):
@@ -160,6 +161,6 @@ async def fetch(request: Request, x_fatty_key: str = Header(default="")):
         return {"transcript": text if len(text) > 40 else "", "captions": text, "title": info.get("title"), "description": desc,
                 "thumbnail": th, "thumbnail_data": thumb_data(th) if th else None, "url": url, "source_url": info.get("webpage_url") or url,
                 "platform": plat, "language": lang if text else (info.get("language") or None), "caption_kind": kind if text else None,
-                "source": "captions" if len(text) > 40 else "description", "caption_error": None if len(text) > 40 else cap_err, "hint": hint}
+                "source": "captions" if len(text) > 40 else "description", "caption_error": None if len(text) > 40 else cap_err, "hint": hint, "clients_tried": tried}
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
