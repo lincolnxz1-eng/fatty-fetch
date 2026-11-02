@@ -149,7 +149,7 @@ async def fetch(request: Request, x_fatty_key: str = Header(default="")):
                         raw = urllib.request.urlopen(urllib.request.Request(f["url"], headers={"User-Agent": "Mozilla/5.0"}), timeout=15).read().decode("utf-8", "ignore")
                         if f.get("ext") == "vtt": text = clean_subs(raw); break
                     except Exception as e: cap_err = cap_err or str(e)[:200]
-        elif not cap_err: cap_err = "This video has no captions YouTube would give the server."
+        elif not cap_err: cap_err = "YouTube gave the server no caption tracks (every player client returned none; usually the datacenter bot wall, which cookies would fix)."
         desc = (info.get("description") or "")[:4000]
         if len(text) <= 40 and len(desc) <= 40:
             return err("Couldn't read this video's captions" + (f" ({cap_err})" if cap_err else " (none found)") + ". Paste the transcript into box 2.", 502 if cap_err else 404)
