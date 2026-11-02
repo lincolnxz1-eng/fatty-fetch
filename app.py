@@ -8,6 +8,13 @@ import yt_dlp
 KEY = os.environ.get("FATTY_FETCH_KEY", "")
 CLIENT_CHAINS = [None, ["tv_embedded", "android_vr"], ["android_vr"], ["tv_simply", "web_safari", "mweb"]]
 
+CAPTION_CHAINS = [None, ["mweb"], ["web_safari"], ["web"]]
+
+def promo_only(desc):
+    d = desc or ""
+    if re.search(r"ingredients?\s*[:：\n]|材料|配料|\d+\s*(g|kg|ml|cups?|tbsp|tsp|tablespoons?|teaspoons?|grams?)\b", d, re.I): return False
+    return True
+
 def cookie_file():
     """Netscape cookies.txt from env FATTY_YT_COOKIES (raw text or base64) or path YOUTUBE_COOKIES_FILE."""
     p = os.environ.get("YOUTUBE_COOKIES_FILE")
@@ -41,8 +48,11 @@ def clean_subs(text):
 
 def pick_lang(info):
     """Uploaded captions beat auto; Cantonese (yue) > zh-Hant > zh-Hans > en; the video's original-language auto track if no uploads."""
+    vl = (info.get("language") or "").lower()
+    zh_video = vl.split("-")[0] in ("zh", "yue") or (not vl and bool(re.search(r"[\u4e00-\u9fff]", info.get("title") or "")))
     def rank(l):
         l2 = l.lower()
+        if not zh_video and l2.split("-")[0] == "en": return -1  # non-Chinese video: English beats Chinese translations
         for i, z in enumerate(ZH):
             if l2 == z.lower() or l2.startswith(z.lower() + "-"): return i
         return 50 if l2.split("-")[0] == "en" else 99
@@ -88,7 +98,7 @@ async def fetch(request: Request, x_fatty_key: str = Header(default="")):
                   "outtmpl": os.path.join(tmp, "v.%(ext)s")}
         ck = cookie_file()
         if ck: common["cookiefile"] = ck
-        info = None; last = ""
+        base = dict(common); info = None; last = ""
         for chain in CLIENT_CHAINS:
             opts = {**common, "ignore_no_formats_error": True}
             if chain: opts["extractor_args"] = {"youtube": {"player_client": chain}}
@@ -101,18 +111,36 @@ async def fetch(request: Request, x_fatty_key: str = Header(default="")):
             if re.search(r"not a bot|sign in|cookies", last, re.I):
                 return err("YouTube blocked the server (\"sign in to confirm you're not a bot\")" + ("" if ck else "; set FATTY_YT_COOKIES on the server") + ". Paste the captions or use the Computer bridge.", 503, blocked=True, cookies=bool(ck))
             return err("Couldn't fetch from YouTube: " + last.split(":", 1)[-1].strip()[:200], 502)
-        lang, track, kind = pick_lang(info); text = ""; cap_err = None
+        used = common.get("extractor_args", {}).get("youtube", {}).get("player_client")
+        lang, track, kind = pick_lang(info); text = ""; cap_err = None; cap_opts = None
+        if not track:  # metadata client exposed no caption maps: ask caption-capable clients and merge
+            for chain in CAPTION_CHAINS:
+                if chain == used: continue
+                o = {**base, "ignore_no_formats_error": True}
+                if chain: o["extractor_args"] = {"youtube": {"player_client": chain}}
+                try:
+                    with yt_dlp.YoutubeDL(o) as y: i2 = y.extract_info(url, download=False)
+                except Exception as e:
+                    cap_err = cap_err or str(e).split(":", 1)[-1].strip()[:200]; continue
+                if i2 and pick_lang(i2)[1]:
+                    info["subtitles"] = i2.get("subtitles") or {}; info["automatic_captions"] = i2.get("automatic_captions") or {}
+                    for k in ("title", "description", "thumbnail"):
+                        if len(str(i2.get(k) or "")) > len(str(info.get(k) or "")): info[k] = i2[k]
+                    cap_opts = o; break
+            lang, track, kind = pick_lang(info)
         if track:
-            try:
-                with yt_dlp.YoutubeDL({**common, "writesubtitles": kind == "manual", "writeautomaticsub": kind == "auto",
-                                       "subtitleslangs": [track], "subtitlesformat": "vtt/srt/best"}) as y:
-                    y.process_ie_result(info, download=True)
-                subs = glob.glob(os.path.join(tmp, "*.vtt")) + glob.glob(os.path.join(tmp, "*.srt"))
-                if subs: text = clean_subs(open(subs[0], encoding="utf-8", errors="ignore").read())
-            except Exception as e:
-                cap_err = str(e).split(":", 1)[-1].strip()[:200]
-            for attempt in range(2 if not text else 0):  # fallback: read the track URL directly (retry once after a 429)
-                if text: break
+            for o in [x for x in (common, cap_opts) if x]:
+                if len(text) > 40: break
+                try:
+                    with yt_dlp.YoutubeDL({**o, "writesubtitles": kind == "manual", "writeautomaticsub": kind == "auto",
+                                           "subtitleslangs": [track], "subtitlesformat": "vtt/srt/best"}) as y:
+                        y.process_ie_result(dict(info), download=True)
+                    subs = glob.glob(os.path.join(tmp, "*.vtt")) + glob.glob(os.path.join(tmp, "*.srt"))
+                    if subs: text = clean_subs(open(subs[0], encoding="utf-8", errors="ignore").read())
+                except Exception as e:
+                    cap_err = str(e).split(":", 1)[-1].strip()[:200]
+            for attempt in range(2 if len(text) <= 40 else 0):  # fallback: read the track URL directly (retry once after a 429)
+                if len(text) > 40: break
                 if attempt: __import__("time").sleep(2)
                 tr = ((info.get("subtitles") if kind == "manual" else info.get("automatic_captions")) or {}).get(track) or []
                 for f in sorted(tr, key=lambda f: f.get("ext") != "vtt"):
@@ -120,13 +148,18 @@ async def fetch(request: Request, x_fatty_key: str = Header(default="")):
                         raw = urllib.request.urlopen(urllib.request.Request(f["url"], headers={"User-Agent": "Mozilla/5.0"}), timeout=15).read().decode("utf-8", "ignore")
                         if f.get("ext") == "vtt": text = clean_subs(raw); break
                     except Exception as e: cap_err = cap_err or str(e)[:200]
+        elif not cap_err: cap_err = "This video has no captions YouTube would give the server."
         desc = (info.get("description") or "")[:4000]
         if len(text) <= 40 and len(desc) <= 40:
             return err("Couldn't read this video's captions" + (f" ({cap_err})" if cap_err else " (none found)") + ". Paste the transcript into box 2.", 502 if cap_err else 404)
+        hint = None
+        if len(text) <= 40 and promo_only(desc):
+            hint = "No captions and the description has no ingredient list (often only a blog link). Paste the transcript or recipe into box 2."
+            cap_err = (cap_err + " — " if cap_err else "") + hint
         th = info.get("thumbnail")
         return {"transcript": text if len(text) > 40 else "", "captions": text, "title": info.get("title"), "description": desc,
                 "thumbnail": th, "thumbnail_data": thumb_data(th) if th else None, "url": url, "source_url": info.get("webpage_url") or url,
                 "platform": plat, "language": lang if text else (info.get("language") or None), "caption_kind": kind if text else None,
-                "source": "captions" if len(text) > 40 else "description", "caption_error": None if text else cap_err}
+                "source": "captions" if len(text) > 40 else "description", "caption_error": None if len(text) > 40 else cap_err, "hint": hint}
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
