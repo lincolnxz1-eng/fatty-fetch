@@ -6,6 +6,21 @@ from fastapi.responses import JSONResponse
 import yt_dlp
 
 KEY = os.environ.get("FATTY_FETCH_KEY", "")
+CLIENT_CHAINS = [None, ["tv_embedded", "android_vr"], ["android_vr"], ["tv_simply", "web_safari", "mweb"]]
+
+def cookie_file():
+    """Netscape cookies.txt from env FATTY_YT_COOKIES (raw text or base64) or path YOUTUBE_COOKIES_FILE."""
+    p = os.environ.get("YOUTUBE_COOKIES_FILE")
+    if p and os.path.exists(p): return p
+    c = os.environ.get("FATTY_YT_COOKIES", "").strip()
+    if not c: return None
+    if "\t" not in c and "Netscape" not in c:
+        try: c = base64.b64decode(c).decode()
+        except Exception: pass
+    p = os.path.join(tempfile.gettempdir(), "fatty_yt_cookies.txt")
+    if not os.path.exists(p):
+        with open(p, "w") as f: f.write(c.replace("\\n", "\n") + "\n")
+    return p
 app = FastAPI(title="Fatty fetch API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "POST", "OPTIONS"], allow_headers=["*"])
 ZH = ("yue", "zh-HK", "zh-Hant", "zh-TW", "zh-Hans", "zh-CN", "zh-SG", "zh")
@@ -52,7 +67,7 @@ def thumb_data(u):
 def err(msg, code=400, **kw): return JSONResponse({"error": msg, **kw}, status_code=code)
 
 @app.get("/health")
-def health(): return {"ok": True, "yt_dlp": yt_dlp.version.__version__, "key_required": bool(KEY)}
+def health(): return {"ok": True, "yt_dlp": yt_dlp.version.__version__, "key_required": bool(KEY), "cookies": bool(cookie_file())}
 
 @app.api_route("/fetch", methods=["GET", "POST"])
 async def fetch(request: Request, x_fatty_key: str = Header(default="")):
@@ -71,13 +86,21 @@ async def fetch(request: Request, x_fatty_key: str = Header(default="")):
     try:
         common = {"quiet": True, "no_warnings": True, "noprogress": True, "noplaylist": True, "skip_download": True, "socket_timeout": 25,
                   "outtmpl": os.path.join(tmp, "v.%(ext)s")}
-        try:
-            with yt_dlp.YoutubeDL(common) as y: info = y.extract_info(url, download=False)
-        except Exception as e:
-            m = str(e)
-            if re.search(r"not a bot|sign in|cookies", m, re.I):
-                return err("YouTube blocked the server (\"sign in to confirm you're not a bot\"). Paste the captions or use the Computer bridge.", 503, blocked=True)
-            return err("Couldn't fetch from YouTube: " + m.split(":", 1)[-1].strip()[:200], 502)
+        ck = cookie_file()
+        if ck: common["cookiefile"] = ck
+        info = None; last = ""
+        for chain in CLIENT_CHAINS:
+            opts = {**common, "ignore_no_formats_error": True}
+            if chain: opts["extractor_args"] = {"youtube": {"player_client": chain}}
+            try:
+                with yt_dlp.YoutubeDL(opts) as y: info = y.extract_info(url, download=False)
+                if info: common = opts; break
+            except Exception as e:
+                last = str(e)
+        if not info:
+            if re.search(r"not a bot|sign in|cookies", last, re.I):
+                return err("YouTube blocked the server (\"sign in to confirm you're not a bot\")" + ("" if ck else "; set FATTY_YT_COOKIES on the server") + ". Paste the captions or use the Computer bridge.", 503, blocked=True, cookies=bool(ck))
+            return err("Couldn't fetch from YouTube: " + last.split(":", 1)[-1].strip()[:200], 502)
         lang, track, kind = pick_lang(info); text = ""; cap_err = None
         if track:
             try:

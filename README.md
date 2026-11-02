@@ -28,3 +28,10 @@ Lets the phone (Chrome PWA or Fatty.apk) turn a **YouTube** link into captions w
 - YouTube sometimes rate-limits (429) or bot-blocks datacenter IPs; then you get the description only or an error → paste captions or use the Computer bridge.
 - Instagram/TikTok: not supported (need login cookies).
 - Local test: `pip install -r requirements.txt && uvicorn app:app --port 10000`
+
+## YouTube "sign in to confirm you're not a bot"
+The server tries several yt-dlp player clients (default, tv_embedded+android_vr, android_vr, tv_simply/web_safari/mweb).
+If Render's IP is still blocked, give it YouTube cookies once:
+1. In desktop Chrome, install the "Get cookies.txt LOCALLY" extension, open youtube.com while signed in (ideally a throwaway Google account), click the extension, Export (Netscape format).
+2. Render dashboard -> fatty-fetch -> Environment -> add `FATTY_YT_COOKIES` = the whole file contents (or base64 of it). Save; it redeploys.
+3. `/health` shows `"cookies": true`. Re-export if YouTube starts blocking again (cookies expire / get rotated).
